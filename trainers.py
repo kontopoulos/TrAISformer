@@ -279,7 +279,7 @@ class Trainer:
             # ==========================================================================================
             # ==========================================================================================
             raw_model = model.module if hasattr(self.model, "module") else model
-            seqs, masks, seqlens, mmsis, time_starts = iter(aisdls["test"]).next()
+            seqs, masks, seqlens, mmsis, time_starts = next(iter(aisdls["test"]))
             n_plots = 7
             init_seqlen = INIT_SEQLEN
             seqs_init = seqs[:n_plots, :init_seqlen, :].to(self.device)
@@ -294,7 +294,7 @@ class Trainer:
 
             img_path = os.path.join(self.savedir, f'epoch_{epoch + 1:03d}.jpg')
             plt.figure(figsize=(9, 6), dpi=150)
-            cmap = plt.cm.get_cmap("jet")
+            cmap = plt.get_cmap("jet")
             preds_np = preds.detach().cpu().numpy()
             inputs_np = seqs.detach().cpu().numpy()
             for idx in range(n_plots):
