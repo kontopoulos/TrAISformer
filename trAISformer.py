@@ -71,9 +71,13 @@ if __name__ == "__main__":
     ## Data
     # ===============================
     moving_threshold = 0.05
+    l_phases = ["train", "valid", "test"]
     l_pkl_filenames = [cf.trainset_name, cf.validset_name, cf.testset_name]
+    if "calib" in cf.eval_splits:
+        l_phases.append("calib")
+        l_pkl_filenames.append(cf.calibset_name)
     Data, aisdatasets, aisdls = {}, {}, {}
-    for phase, filename in zip(("train", "valid", "test"), l_pkl_filenames):
+    for phase, filename in zip(l_phases, l_pkl_filenames):
         datapath = os.path.join(cf.datadir, filename)
         print(f"Loading {datapath}...")
         with open(datapath, "rb") as f:
@@ -98,7 +102,7 @@ if __name__ == "__main__":
             aisdatasets[phase] = datasets.AISDataset(Data[phase],
                                                      max_seqlen=cf.max_seqlen + 1,
                                                      device=cf.device)
-        if phase == "test":
+        if phase in ("test", "calib"):
             shuffle = False
         else:
             shuffle = True
@@ -140,7 +144,8 @@ if __name__ == "__main__":
     #   point_nm     error of the sample-mean position (a point forecast)
     #   spread_nm    mean distance of the samples to their mean (spread proxy)
     #   spread_corr  Spearman correlation between spread and point error
-    # All sampled futures are saved to test_predictions.npz for the UQ step.
+    # This runs for every split in cf.eval_splits (e.g. "calib" and "test");
+    # all sampled futures are saved to <split>_predictions.npz for the UQ step.
     model.load_state_dict(torch.load(cf.ckpt_path, map_location=cf.device))
     model.eval()
 
@@ -159,87 +164,95 @@ if __name__ == "__main__":
             + torch.cos(a[..., 0]) * torch.cos(b[..., 0]) * torch.sin((b[..., 1] - a[..., 1]) / 2) ** 2
         return 2 * 3440.065 * torch.asin(torch.sqrt(h.clamp(0, 1)))
 
-    # Decision points: index s means the model sees traj[s - init_seqlen:s]
-    # and is scored on traj[s:s + n_steps].
-    l_track, l_start = [], []
-    for j, V in enumerate(Data["test"]):
-        last = len(V["traj"]) - n_steps
-        if last < init_seqlen:
-            continue
-        starts = [init_seqlen] if cf.eval_stride is None else range(init_seqlen, last + 1, cf.eval_stride)
-        l_track += [j] * len(starts)
-        l_start += list(starts)
-    track_id, start = np.array(l_track), np.array(l_start)
-    X = torch.tensor(np.stack([np.minimum(Data["test"][j]["traj"][s - init_seqlen:s + n_steps, :4], 0.9999)
-                               for j, s in zip(track_id, start)]), dtype=torch.float32)
+    def evaluate(split):
+        """Sample futures from decision points of one split; save metrics and predictions."""
+        # Decision points: index s means the model sees traj[s - init_seqlen:s]
+        # and is scored on traj[s:s + n_steps].
+        l_track, l_start = [], []
+        for j, V in enumerate(Data[split]):
+            last = len(V["traj"]) - n_steps
+            if last < init_seqlen:
+                continue
+            starts = [init_seqlen] if cf.eval_stride is None else range(init_seqlen, last + 1, cf.eval_stride)
+            l_track += [j] * len(starts)
+            l_start += list(starts)
+        track_id, start = np.array(l_track), np.array(l_start)
+        X = torch.tensor(np.stack([np.minimum(Data[split][j]["traj"][s - init_seqlen:s + n_steps, :4], 0.9999)
+                                   for j, s in zip(track_id, start)]), dtype=torch.float32)
 
-    l_preds = []
-    with torch.no_grad():
-        for b in tqdm(range(0, len(X), cf.eval_batch)):
-            seqs_init = X[b:b + cf.eval_batch, :init_seqlen].to(cf.device)
-            bs = seqs_init.shape[0]
-            preds = trainers.sample(model,
-                                    seqs_init.repeat_interleave(cf.n_samples, dim=0),
-                                    n_steps,
-                                    temperature=1.0,
-                                    sample=True,
-                                    sample_mode=cf.sample_mode,
-                                    r_vicinity=cf.r_vicinity,
-                                    top_k=cf.top_k)
-            preds = preds[:, init_seqlen:, :].reshape(bs, cf.n_samples, n_steps, 4)
-            l_preds.append(to_deg(preds).cpu())
+        l_preds = []
+        with torch.no_grad():
+            for b in tqdm(range(0, len(X), cf.eval_batch)):
+                seqs_init = X[b:b + cf.eval_batch, :init_seqlen].to(cf.device)
+                bs = seqs_init.shape[0]
+                preds = trainers.sample(model,
+                                        seqs_init.repeat_interleave(cf.n_samples, dim=0),
+                                        n_steps,
+                                        temperature=1.0,
+                                        sample=True,
+                                        sample_mode=cf.sample_mode,
+                                        r_vicinity=cf.r_vicinity,
+                                        top_k=cf.top_k)
+                preds = preds[:, init_seqlen:, :].reshape(bs, cf.n_samples, n_steps, 4)
+                l_preds.append(to_deg(preds).cpu())
 
-    preds = torch.cat(l_preds).double()            # (n_points, n_samples, n_steps, 2)
-    truth = to_deg(X[:, init_seqlen:]).double()     # (n_points, n_steps, 2)
-    hist = to_deg(X[:, :init_seqlen]).double()      # (n_points, init_seqlen, 2)
+        preds = torch.cat(l_preds).double()            # (n_points, n_samples, n_steps, 2)
+        truth = to_deg(X[:, init_seqlen:]).double()     # (n_points, n_steps, 2)
+        hist = to_deg(X[:, :init_seqlen]).double()      # (n_points, init_seqlen, 2)
 
-    errors = haversine_nm(truth[:, None], preds)       # (n_points, n_samples, n_steps)
-    centre = preds.mean(dim=1)                         # (n_points, n_steps, 2)
-    point_errors = haversine_nm(truth, centre)          # (n_points, n_steps)
-    spread = haversine_nm(centre[:, None], preds).mean(dim=1)  # (n_points, n_steps)
+        errors = haversine_nm(truth[:, None], preds)       # (n_points, n_samples, n_steps)
+        centre = preds.mean(dim=1)                         # (n_points, n_steps, 2)
+        point_errors = haversine_nm(truth, centre)          # (n_points, n_steps)
+        spread = haversine_nm(centre[:, None], preds).mean(dim=1)  # (n_points, n_steps)
 
-    def spearman(a, b):
-        ra = np.argsort(np.argsort(a)).astype(float)
-        rb = np.argsort(np.argsort(b)).astype(float)
-        return float(np.corrcoef(ra, rb)[0, 1])
+        def spearman(a, b):
+            ra = np.argsort(np.argsort(a)).astype(float)
+            rb = np.argsort(np.argsort(b)).astype(float)
+            return float(np.corrcoef(ra, rb)[0, 1])
 
-    def summarise(sel, name):
-        """Per-horizon metrics over the decision points selected by the boolean mask sel."""
-        sel = torch.from_numpy(sel)
-        out = {"n_points": int(sel.sum()), "horizons": {}}
-        logging.info(f"[{name}] decision points: {out['n_points']}, samples per point: {cf.n_samples}")
-        logging.info(f"{'horizon':>8} {'mean_nm':>8} {'best_nm':>8} {'point_nm':>9} {'median':>7} "
-                     f"{'spread_nm':>10} {'spread_corr':>12}")
-        for h in horizons:
-            i = h - 1
-            e, pe, sp = errors[sel, :, i], point_errors[sel, i], spread[sel, i]
-            m = {"mean_nm": float(e.mean()),
-                 "best_nm": float(e.min(dim=1).values.mean()),
-                 "point_nm": float(pe.mean()),
-                 "median_point_nm": float(pe.median()),
-                 "spread_nm": float(sp.mean()),
-                 "spread_corr": spearman(sp.numpy(), pe.numpy())}
-            label = f"{h * cf.step_minutes} min"
-            out["horizons"][label] = m
-            logging.info(f"{label:>8} {m['mean_nm']:8.3f} {m['best_nm']:8.3f} {m['point_nm']:9.3f} "
-                         f"{m['median_point_nm']:7.3f} {m['spread_nm']:10.3f} {m['spread_corr']:12.3f}")
-        return out
+        def summarise(sel, name):
+            """Per-horizon metrics over the decision points selected by the boolean mask sel."""
+            sel = torch.from_numpy(sel)
+            out = {"n_points": int(sel.sum()), "horizons": {}}
+            logging.info(f"[{split}: {name}] decision points: {out['n_points']}, samples per point: {cf.n_samples}")
+            logging.info(f"{'horizon':>8} {'mean_nm':>8} {'best_nm':>8} {'point_nm':>9} {'median':>7} "
+                         f"{'spread_nm':>10} {'spread_corr':>12}")
+            for h in horizons:
+                i = h - 1
+                e, pe, sp = errors[sel, :, i], point_errors[sel, i], spread[sel, i]
+                m = {"mean_nm": float(e.mean()),
+                     "best_nm": float(e.min(dim=1).values.mean()),
+                     "point_nm": float(pe.mean()),
+                     "median_point_nm": float(pe.median()),
+                     "spread_nm": float(sp.mean()),
+                     "spread_corr": spearman(sp.numpy(), pe.numpy())}
+                label = f"{h * cf.step_minutes} min"
+                out["horizons"][label] = m
+                logging.info(f"{label:>8} {m['mean_nm']:8.3f} {m['best_nm']:8.3f} {m['point_nm']:9.3f} "
+                             f"{m['median_point_nm']:7.3f} {m['spread_nm']:10.3f} {m['spread_corr']:12.3f}")
+            return out
 
-    metrics = {"n_samples": cf.n_samples, "step_minutes": cf.step_minutes, "eval_stride": cf.eval_stride,
-               "n_tracks": int(len(np.unique(track_id))),
-               "all_points": summarise(np.ones(len(X), bool), "all decision points"),
-               "first_point": summarise(start == init_seqlen, "first decision point of each track")}
+        metrics = {"n_samples": cf.n_samples, "step_minutes": cf.step_minutes, "eval_stride": cf.eval_stride,
+                   "n_tracks": int(len(np.unique(track_id))),
+                   "all_points": summarise(np.ones(len(X), bool), "all decision points"),
+                   "first_point": summarise(start == init_seqlen, "first decision point of each track")}
 
-    with open(os.path.join(cf.savedir, "test_metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-    t_decision = np.array([Data["test"][j]["traj"][s - 1, 4] for j, s in zip(track_id, start)])
-    mmsi = np.array([Data["test"][j]["mmsi"] for j in track_id])
-    np.savez_compressed(os.path.join(cf.savedir, "test_predictions.npz"),
-                        preds=preds.float().numpy(), truth=truth.float().numpy(), hist=hist.float().numpy(),
-                        hist_sog=(X[:, :init_seqlen, 2] * cf.sog_max).numpy(),
-                        hist_cog=(X[:, :init_seqlen, 3] * 360.).numpy(),
-                        track_id=track_id, start=start, mmsi=mmsi, t_decision=t_decision,
-                        step_minutes=cf.step_minutes)
+        with open(os.path.join(cf.savedir, f"{split}_metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+        t_decision = np.array([Data[split][j]["traj"][s - 1, 4] for j, s in zip(track_id, start)])
+        mmsi = np.array([Data[split][j]["mmsi"] for j in track_id])
+        np.savez_compressed(os.path.join(cf.savedir, f"{split}_predictions.npz"),
+                            preds=preds.float().numpy(), truth=truth.float().numpy(), hist=hist.float().numpy(),
+                            hist_sog=(X[:, :init_seqlen, 2] * cf.sog_max).numpy(),
+                            hist_cog=(X[:, :init_seqlen, 3] * 360.).numpy(),
+                            track_id=track_id, start=start, mmsi=mmsi, t_decision=t_decision,
+                            step_minutes=cf.step_minutes)
+        return errors, point_errors, spread
+
+    for split in cf.eval_splits:
+        result = evaluate(split)
+        if split == "test":
+            errors, point_errors, spread = result
 
     ## Plot
     # ===============================

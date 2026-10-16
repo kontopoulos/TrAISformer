@@ -48,6 +48,7 @@ class Config():
         step_minutes = 10
         eval_horizons = [6, 12, 18]
         eval_stride = None  # one start per track, as in the paper
+        eval_splits = ["test"]
 
         # When mode == "grad" or "pos_grad", sog and cog are actually dlat and
         # dlon
@@ -79,7 +80,7 @@ class Config():
         patience = 5      # stop after this many epochs without a better valid loss
         legacy_lr_schedule = False  # cosine over max_epochs of real tokens, then hold the floor
         batch_size = 32
-        n_samples = 16
+        n_samples = 100   # sampled futures per decision point (spread estimate for conformal)
 
         init_seqlen = 20  # 20 min of history
         max_seqlen = 120  # = WINDOW_MIN in prepare_syros.py
@@ -91,6 +92,9 @@ class Config():
         # Evaluate from a decision point every eval_stride steps inside each
         # test window (not only its start, which is biased towards departures).
         eval_stride = 10
+        # "calib" (9-15 Sep) is held out from training and early stopping and
+        # is used only to calibrate the conformal regions (uq/conformal.py).
+        eval_splits = ["calib", "test"]
 
         # ~0.002 deg cells: ~220 m (lat) x ~180 m (lon)
         lat_size = 450
@@ -122,7 +126,8 @@ class Config():
                             # "ce_vicinity", "gridcont_grid", "gridcont_real", "gridcont_gridsin", "gridcont_gridsigmoid"
     sample_mode =  "pos_vicinity" # "pos", "pos_vicinity" or "velo"
     top_k = 10 # int or None
-    eval_batch = 64  # decision points per sampling batch (x n_samples sequences)
+    # decision points per sampling batch; ~1024 sequences (points x n_samples) fit in 8 GB
+    eval_batch = max(1, 1024 // n_samples)
 
     # Blur flags
     #===================================================
@@ -139,6 +144,7 @@ class Config():
     trainset_name = f"{dataset_name}_train.pkl"
     validset_name = f"{dataset_name}_valid.pkl"
     testset_name = f"{dataset_name}_test.pkl"
+    calibset_name = f"{dataset_name}_calib.pkl"
 
 
     # model parameters
