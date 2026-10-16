@@ -205,8 +205,11 @@ class Trainer:
 
                     # decay the learning rate based on our progress
                     if config.lr_decay:
-                        self.tokens += (
-                                seqs >= 0).sum()  # number of tokens processed this step (i.e. label is not -100)
+                        if getattr(config, "legacy_lr_schedule", False):
+                            # original: counts every element of the padded batch, all 4 features
+                            self.tokens += (seqs >= 0).sum()
+                        else:
+                            self.tokens += masks.sum()  # number of real (non-padding) targets
                         if self.tokens < config.warmup_tokens:
                             # linear warmup
                             lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
@@ -214,6 +217,8 @@ class Trainer:
                             # cosine learning rate decay
                             progress = float(self.tokens - config.warmup_tokens) / float(
                                 max(1, config.final_tokens - config.warmup_tokens))
+                            if not getattr(config, "legacy_lr_schedule", False):
+                                progress = min(progress, 1.0)  # stay at the floor instead of rising again
                             lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
                         lr = config.learning_rate * lr_mult
                         for param_group in optimizer.param_groups:
@@ -275,6 +280,9 @@ class Trainer:
                 best_epoch = epoch
                 self.save_checkpoint(best_epoch + 1)
 
+            patience = getattr(config, "patience", None)
+            stop_early = patience is not None and epoch - best_epoch >= patience
+
             ## SAMPLE AND PLOT
             # ==========================================================================================
             # ==========================================================================================
@@ -285,7 +293,7 @@ class Trainer:
             seqs_init = seqs[:n_plots, :init_seqlen, :].to(self.device)
             preds = sample(raw_model,
                            seqs_init,
-                           96 - init_seqlen,
+                           min(96, config.max_seqlen) - init_seqlen,
                            temperature=1.0,
                            sample=True,
                            sample_mode=self.config.sample_mode,
@@ -311,6 +319,10 @@ class Trainer:
             plt.ylim([-0.05, 1.05])
             plt.savefig(img_path, dpi=150)
             plt.close()
+
+            if stop_early:
+                logging.info(f"Early stopping: no improvement for {patience} epochs (best epoch {best_epoch + 1:03d}).")
+                break
 
         # Final state
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
